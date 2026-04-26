@@ -16,6 +16,10 @@ import asyncio
 import logging
 import time
 from typing import Any
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 import httpx
 
@@ -169,7 +173,7 @@ class AsyncPalmPesaClient:
         """Close the underlying async HTTP connection pool."""
         await self._http.aclose()
 
-    async def __aenter__(self) -> "AsyncPalmPesaClient":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *_: Any) -> None:

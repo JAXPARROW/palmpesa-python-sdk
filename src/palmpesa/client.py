@@ -11,6 +11,10 @@ import logging
 import time
 import threading
 from typing import Any
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 import httpx
 
@@ -166,7 +170,7 @@ class PalmPesaClient:
         """Close the underlying HTTP connection pool."""
         self._http.close()
 
-    def __enter__(self) -> "PalmPesaClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: Any) -> None:
