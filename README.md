@@ -1,25 +1,26 @@
 # PalmPesa Python SDK
 
-Production-grade Python SDK for the [PalmPesa](https://palmpesa.drmlelwa.co.tz) payment API — supports both **sync** and **async** usage, automatic retries, typed exceptions, and webhook validation.
+Production-grade Python SDK for the [PalmPesa](https://palmpesa.co.tz) **Payments API v2**: sync and async clients, safe retries keyed on `transaction_id`, typed models, signed-callback verification and a structured exception hierarchy.
 
 [![PyPI version](https://img.shields.io/pypi/v/palmpesa-python-sdk.svg)](https://pypi.org/project/palmpesa-python-sdk/)
 [![Python versions](https://img.shields.io/pypi/pyversions/palmpesa-python-sdk.svg)](https://pypi.org/project/palmpesa-python-sdk/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+> Upgrading from 0.1.x (API v1)? 0.2.0 is a breaking release. See the [migration table](CHANGELOG.md#migrating-from-01x).
+
+API reference: <https://documentation.palmpesa.co.tz/>
+
 ---
 
 ## Features
 
-- **Sync & Async** — `PalmPesa` for blocking code, `AsyncPalmPesa` for asyncio
-- **USSD Push payments** — initiate STK prompts and poll order status
-- **Auto retries** — exponential backoff on transient 5xx errors
-- **Typed exceptions** — structured error hierarchy (never a bare `Exception`)
-- **Thread-safe** — share a single client across threads
-- **Context manager** — `with` / `async with` for automatic cleanup
-- **Webhook validation** — verify and parse incoming payment callbacks
-- **PEP 561 compliant** — ships with `py.typed`
-
----
+- **Sync & async**: `PalmPesa` for blocking code, `AsyncPalmPesa` for asyncio
+- **Safe retries**: network errors, timeouts, 429 and 5xx are retried with jittered backoff, including `POST`. PalmPesa treats a repeated `transaction_id` as the same payment, so a retry never charges twice.
+- **Typed models**: `Payment`, `PaymentStatus`, `CallbackEvent` with `is_paid` / `is_final`
+- **Signed callbacks**: HMAC-SHA256 verification, replay window, event-id checks
+- **Local validation**: bad amount, phone, email, `transaction_id` or callback URL is rejected before any network call
+- **Typed exceptions**: never a bare `Exception`; 422 field errors exposed
+- **Thread-safe**, context managers, PEP 561 (`py.typed`), mypy-strict clean
 
 ## Installation
 
@@ -27,174 +28,166 @@ Production-grade Python SDK for the [PalmPesa](https://palmpesa.drmlelwa.co.tz) 
 pip install palmpesa-python-sdk
 ```
 
-Requires Python 3.10 or newer.
+Requires Python 3.10+.
 
 ---
 
-## Quick Start
-
-### Synchronous
+## Quick start
 
 ```python
-from palmpesa import PalmPesa
+from palmpesa import PalmPesa, generate_transaction_id
 
-with PalmPesa(api_token="your-api-token") as client:
-    # Initiate a USSD push payment (minimum amount: 500 TZS)
-    result = client.payments.initiate_mobile_payment(
-        amount=1000,
-        phone="0693662424",
-        transaction_id="TXN-001",
-        name="John Doe",
-        email="john@example.com",
-        callback_url="https://yourapp.com/webhook/palmpesa",
+with PalmPesa(api_token="YOUR_API_TOKEN") as palmpesa:
+    # 1. Generate and STORE your transaction_id before calling PalmPesa.
+    tid = generate_transaction_id("ORDER")
+
+    # 2. Push the mobile-money prompt. 202 Accepted ≠ paid.
+    payment = palmpesa.payments.request_payment(
+        transaction_id=tid,
+        amount=10_000,                      # whole TZS, 100 – 100,000,000
+        phone="0712345678",                 # any TZ format → 255712345678
+        name="Juma Hassan",
+        email="juma@example.com",
+        callback_url="https://shop.example.com/palmpesa/callback",
+        buyer_remarks="Payment for order 123",   # optional, shown to customer
     )
-    print(result["order_id"])
+    print(payment.order_id, payment.status)      # PALMPESAV2A… PaymentStatus.INITIATING
 
-    # Check payment status
-    status = client.payments.get_order_status(result["order_id"])
-    print(status["payment_status"])  # PENDING | COMPLETED | FAILED
-
-    # List transactions
-    txns = client.transactions.list_all(page=1, per_page=20)
+    # 3. Wait for the callback (preferred) — or check the status:
+    payment = palmpesa.payments.get_payment(payment.order_id)
+    if payment.is_paid:
+        ...  # fulfil
 ```
 
-### Asynchronous
+### Async
 
 ```python
 import asyncio
 from palmpesa import AsyncPalmPesa
 
-async def main():
-    async with AsyncPalmPesa(api_token="your-api-token") as client:
-        result = await client.payments.initiate_mobile_payment(
-            amount=1000,
-            phone="0693662424",
-            transaction_id="TXN-001",
-            name="John Doe",
-            email="john@example.com",
-            callback_url="https://yourapp.com/webhook/palmpesa",
-        )
-        status = await client.payments.get_order_status(result["order_id"])
+async def main() -> None:
+    async with AsyncPalmPesa(api_token="YOUR_API_TOKEN") as palmpesa:
+        payment = await palmpesa.payments.request_payment(...)
+        final = await palmpesa.payments.wait_for_final_status(payment.order_id, timeout=300)
 
 asyncio.run(main())
 ```
 
 ---
 
-## USSD Push Payments
+## Payments
 
-> **Minimum amount: 500 TZS**
->
-> The PalmPesa gateway enforces a minimum payment amount of **TZS 500** for USSD push (STK) requests. Amounts below this threshold will be rejected by the API.
+### `request_payment(*, transaction_id, amount, phone, name, email, callback_url, buyer_remarks=None, merchant_remarks=None, currency="TZS") -> Payment`
 
-### `initiate_mobile_payment`
+`POST /api/v2/async/payments`. All arguments are keyword-only.
 
-Sends a USSD STK push prompt to the customer's phone.
+| Argument | Rules |
+| --- | --- |
+| `transaction_id` | Your unique ID, 1–191 chars of `A-Z a-z 0-9 . _ : -` |
+| `amount` | `int` or integral `Decimal`, **100 – 100,000,000** TZS. `float` is rejected |
+| `phone` | Tanzanian mobile number (`0712…`, `712…`, `255712…`, `+255 712 …`) |
+| `name` | ≤ 255 chars |
+| `email` | Valid email (**required** by v2) |
+| `callback_url` | Public `https://` URL, not localhost or a private IP, ≤ 2048 chars |
+| `buyer_remarks` / `merchant_remarks` | Optional, ≤ 255 chars |
 
-| Parameter | Type | Required | Description |
-| --- | --- | --- | --- |
-| `amount` | `int` | Yes | Amount in TZS — **minimum 500** |
-| `phone` | `str` | Yes | Customer phone in any Tanzanian format (`"0693662424"`, `"+255693662424"`) |
-| `transaction_id` | `str` | Yes | Unique reference for this payment |
-| `name` | `str` | Yes | Customer full name |
-| `email` | `str` | Yes | Customer email address |
-| `callback_url` | `str` | Yes | Publicly reachable URL for payment result callbacks |
-| `address` | `str` | No | Customer address (default: `"Dar es Salaam"`) |
-| `postcode` | `str` | No | Customer postcode (default: `"11111"`) |
+**Retries and duplicates:**
 
-**Returns:** `{"order_id": "...", "message": "..."}`
+- Same `transaction_id` + same details → the original payment comes back. The customer gets no second prompt and no second charge.
+- Same `transaction_id` + different details → `ConflictError` (409).
+- Once a payment is final, a new payment needs a **new** `transaction_id`.
 
-### `get_order_status`
+### `get_payment(order_id) -> Payment`
 
-Poll the result of a previously initiated payment.
+`GET /api/v2/async/payments/{order_id}`. Raises `NotFoundError` for unknown orders.
 
-| Parameter | Type | Description |
+### `wait_for_final_status(order_id, *, timeout=300, poll_interval=5) -> Payment`
+
+Polls until the payment is final or `timeout` elapses, then returns the last state (check `.is_final`). Use it in scripts, tests and reconciliation jobs. In production, rely on callbacks.
+
+### Statuses
+
+| `PaymentStatus` | Final | Meaning |
 | --- | --- | --- |
-| `order_id` | `str` | The `order_id` returned by `initiate_mobile_payment` |
-
-**Returns:** `{"payment_status": "COMPLETED" | "PENDING" | "FAILED", ...}`
-
----
-
-## Transactions
-
-```python
-# Paginated transaction history
-txns = client.transactions.list_all(page=1, per_page=50)
-```
+| `INITIATING` | no | Accepted; prompt not sent yet |
+| `PENDING` | no | Prompt sent; waiting for the customer |
+| `AMBIGUOUS` | no | PalmPesa is confirming the outcome. **Do not resend** |
+| `COMPLETED` | yes | Money received: **the only paid status** |
+| `CANCELLED` | yes | Customer cancelled / did not approve |
+| `REJECTED` | yes | Network rejected the payment |
+| `INITIATION_FAILED` | yes | Prompt not sent; see `payment.failure_reason`; nothing charged |
+| `EXPIRED` | yes* | Not paid within ~1 h. *A late `COMPLETED` can still follow* |
+| `UNKNOWN` | no | Status not known to this SDK version (raw value in `payment.raw`) |
 
 ---
 
-## Webhook Validation
+## Callbacks
 
-Validate and parse callbacks sent to your webhook endpoint:
+PalmPesa POSTs to `callback_url` when a payment reaches a final status. Requirements:
 
-```python
-from palmpesa import WebhookValidator, PAYMENT_STATUS_COMPLETED
-
-validator = WebhookValidator(secret="your-webhook-secret")
-
-# Flask example
-@app.route("/webhook/palmpesa", methods=["POST"])
-def handle_webhook():
-    event = validator.validate(
-        payload=request.data,
-        signature=request.headers.get("X-PalmPesa-Signature", ""),
-    )
-    if event.payment_status == PAYMENT_STATUS_COMPLETED:
-        # fulfil order
-        ...
-    return "", 200
-```
-
----
-
-## Error Handling
+- Respond **2xx within 10 s**. PalmPesa makes up to 5 attempts in total.
+- **Deduplicate on `event_id`.**
+- Before fulfilling, match `transaction_id`, `order_id`, `amount` and `currency` against your records.
+- Treat `payment.completed` as paid even if it arrives **after** `payment.expired`.
 
 ```python
-from palmpesa import (
-    PalmPesa,
-    ValidationError,
-    InsufficientFundsError,
-    AuthenticationError,
-    RateLimitError,
-    ServerError,
-    PalmPesaError,
-)
+import os
+from flask import Flask, request
+from palmpesa import WebhookVerifier, WebhookVerificationError
 
-with PalmPesa(api_token="your-api-token") as client:
+app = Flask(__name__)
+verifier = WebhookVerifier(signing_secret=os.environ.get("PALMPESA_SIGNING_SECRET"))
+
+@app.post("/palmpesa/callback")
+def palmpesa_callback():
     try:
-        result = client.payments.initiate_mobile_payment(
-            amount=1000, phone="0693662424", transaction_id="TXN-001",
-            name="John Doe", email="john@example.com",
-            callback_url="https://yourapp.com/webhook",
-        )
-    except ValidationError as e:
-        print(f"Bad request: {e}")        # e.g. amount below 500, bad phone
-    except InsufficientFundsError as e:
-        print(f"Insufficient funds: {e}")
-    except AuthenticationError as e:
-        print(f"Invalid API token: {e}")
-    except RateLimitError as e:
-        print(f"Rate limited: {e}")
-    except ServerError as e:
-        print(f"PalmPesa server error: {e}")
-    except PalmPesaError as e:
-        print(f"Unexpected error: {e}")
+        event = verifier.verify(request.get_data(), request.headers)   # RAW bytes!
+    except WebhookVerificationError:
+        return "", 401
+
+    if seen_before(event.event_id):
+        return {"received": True}, 200
+
+    order = load_order(event.transaction_id)
+    if event.is_paid and order.amount == event.amount and event.currency == "TZS":
+        fulfil(order, event)
+    return {"received": True}, 200
 ```
 
-### Exception Hierarchy
+If PalmPesa has issued you a signing secret, `verify()` checks `X-PalmPesa-Signature` (`sha256=` + HMAC of `timestamp.body`), rejects timestamps more than 300 s from now, and checks that `X-PalmPesa-Event-Id` matches the body.
+
+**Without a secret**, `verify()` only parses and checks the shape of the callback. Anyone can POST to your URL, so confirm with `payments.get_payment(event.order_id)` before you fulfil.
+
+---
+
+## Errors
 
 ```text
-PalmPesaError
-├── AuthenticationError   (HTTP 401)
-├── ForbiddenError        (HTTP 403)
-├── ValidationError       (HTTP 400 — includes invalid phone, bad payload)
-├── InsufficientFundsError(HTTP 400 — insufficient balance)
-├── NotFoundError         (HTTP 404)
-├── ConflictError         (HTTP 409)
-├── RateLimitError        (HTTP 429)
-└── ServerError           (HTTP 5xx)
+PalmPesaError                 .message .status_code .response .code
+├── NetworkError              connection / DNS / TLS (retry with same transaction_id)
+│   └── RequestTimeoutError
+├── AuthenticationError       401 missing / invalid token
+├── ForbiddenError            403 account pending approval
+│   └── AccountFrozenError    403 code=ACCOUNT_FROZEN
+├── ValidationError           400 / 422, or local validation (.errors: field → [messages])
+├── NotFoundError             404 unknown order_id
+├── ConflictError             409 transaction_id reused with different details
+├── RateLimitError            429 (.retry_after)
+├── ServerError               5xx (retry with same transaction_id)
+└── WebhookVerificationError  bad callback signature / timestamp / body
+```
+
+```python
+from palmpesa import ValidationError, ConflictError, PalmPesaError
+
+try:
+    payment = palmpesa.payments.request_payment(...)
+except ValidationError as e:
+    print(e.message, e.errors)        # {"callback_url": ["..."]}
+except ConflictError:
+    ...                               # generate a new transaction_id
+except PalmPesaError as e:
+    log.error("PalmPesa failed: %r", e)
 ```
 
 ---
@@ -202,42 +195,42 @@ PalmPesaError
 ## Configuration
 
 ```python
-client = PalmPesa(
-    api_token="your-api-token",
-    base_url="https://palmpesa.drmlelwa.co.tz",  # override for staging
-    timeout=30.0,      # request timeout in seconds
-    max_retries=3,     # retry attempts on transient 5xx errors
+PalmPesa(
+    api_token="…",
+    base_url="https://palmpesa.co.tz",  # default
+    timeout=30.0,                        # seconds or httpx.Timeout
+    max_retries=2,                       # extra attempts after the first
+    user_agent="myapp/1.0",              # appended to the SDK User-Agent
+    http_client=None,                    # bring your own httpx.Client
 )
 ```
 
----
-
-## Health Check
+Rate limits: `POST` 30/min, `GET` 120/min per account. Share **one** client per process.
 
 ```python
-if client.is_healthy():
-    print("API reachable and token valid")
+palmpesa.verify_credentials()   # raises AuthenticationError / ForbiddenError …
+palmpesa.is_healthy()           # bool
 ```
+
+Logging goes to the `palmpesa` logger (retries are logged at `WARNING`). The token is never logged.
 
 ---
 
 ## Development
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Lint & format
-ruff check src/
-black src/
-mypy src/
+make install    # pip install -e ".[dev]"
+make check      # ruff + black + mypy --strict + pytest with coverage
+make live       # safe live checks against the real API (needs PALMPESA_API_TOKEN)
 ```
 
----
+`make live` never creates a payment. To run a **real** end-to-end payment to your own phone:
+
+```bash
+python examples/live_check.py pay --phone 0712345678 --amount 100 \
+    --callback-url https://webhook.site/<id> --yes
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

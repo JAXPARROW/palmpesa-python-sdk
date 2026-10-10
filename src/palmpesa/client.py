@@ -1,230 +1,163 @@
 """
-Synchronous PalmPesa HTTP client.
+Synchronous PalmPesa API v2 client.
 
-Handles Bearer-token authentication, retries, and error mapping for all
-blocking (sync) API calls.  For async usage see :mod:`palmpesa.async_client`.
+Usage::
+
+    with PalmPesa(api_token="…") as palmpesa:
+        payment = palmpesa.payments.request_payment(...)
+
+For asyncio see :mod:`palmpesa.async_client`.
 """
 
 from __future__ import annotations
 
-import logging
 import time
-import threading
-from typing import Any
-try:
-    from typing import Self
-except ImportError:
-    from typing_extensions import Self
+from typing import Any, TypeVar
 
 import httpx
 
-from .exceptions import (
-    AuthenticationError,
-    ConflictError,
-    ForbiddenError,
-    InsufficientFundsError,
-    NotFoundError,
-    PalmPesaError,
-    RateLimitError,
-    ServerError,
-    ValidationError,
+from ._base import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
+    HEALTHCHECK_ORDER_ID,
+    RETRY_STATUSES,
+    BaseClient,
+    log_retry,
+    parse_response,
+    retry_delay,
 )
+from .exceptions import NetworkError, NotFoundError, PalmPesaError, RequestTimeoutError
+from .services.payments import PaymentService
 
-logger = logging.getLogger(__name__)
-
-_BASE_URL = "https://palmpesa.drmlelwa.co.tz"
-_DEFAULT_TIMEOUT = 30.0
-_MAX_RETRIES = 3
-_RETRY_STATUSES = {500, 502, 503, 504}
-_INSUFFICIENT_FUNDS_PHRASES = {"insufficient balance", "insufficient funds"}
+_T = TypeVar("_T", bound="PalmPesa")
 
 
-class PalmPesaClient:
+class PalmPesa(BaseClient):
     """
-    Production-grade synchronous HTTP client for the PalmPesa API.
-
-    Features
-    --------
-    - Bearer token authentication on every request.
-    - Exponential-backoff retries on transient 5xx errors.
-    - Structured exception hierarchy — never raises a bare ``Exception``.
-    - Context-manager support (``with`` statement).
-    - Thread-safe by design (one ``httpx.Client`` per instance).
+    Synchronous client for the PalmPesa Payments API v2.
 
     Parameters
     ----------
     api_token:
-        Your PalmPesa Bearer API token.
+        Bearer token from the PalmPesa dashboard. Keep it server-side.
     base_url:
-        Override the base URL (e.g. for a staging environment).
+        API host (default ``https://palmpesa.co.tz``).
     timeout:
-        Request timeout in seconds (default: 30).
+        Seconds, or an :class:`httpx.Timeout` (default 30).
     max_retries:
-        Maximum retry attempts on transient server errors (default: 3).
+        Extra attempts after the first on network errors, timeouts, 429 and
+        5xx (default 2). Retrying ``request_payment`` is safe because PalmPesa
+        de-duplicates on ``transaction_id``.
+    user_agent:
+        Optional suffix appended to the SDK's ``User-Agent``.
+    http_client:
+        Bring your own :class:`httpx.Client` (proxies, custom TLS, …). The SDK
+        will not close a client it did not create.
+
+    The instance is thread-safe; share one per process.
     """
+
+    payments: PaymentService
 
     def __init__(
         self,
         api_token: str,
-        base_url: str = _BASE_URL,
-        timeout: float = _DEFAULT_TIMEOUT,
-        max_retries: int = _MAX_RETRIES,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float | httpx.Timeout = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        user_agent: str | None = None,
+        http_client: httpx.Client | None = None,
     ) -> None:
-        self.api_token = api_token
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self._lock = threading.Lock()
-
-        self._http = httpx.Client(
-            base_url=self.base_url,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            timeout=self.timeout,
+        super().__init__(
+            api_token,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            user_agent=user_agent,
         )
+        self._owns_http = http_client is None
+        self._http = http_client or httpx.Client(timeout=timeout, follow_redirects=False)
+        self.payments = PaymentService(self)
 
     # ------------------------------------------------------------------
     # Core request dispatcher
     # ------------------------------------------------------------------
 
     def request(
-        self,
-        method: str,
-        endpoint: str,
-        json: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> Any:
+        self, method: str, path: str, *, json: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """
-        Execute an authenticated API request with automatic retry on 5xx errors.
+        Send an authenticated request, retrying transient failures.
 
-        Parameters
-        ----------
-        method:   HTTP verb (``"GET"``, ``"POST"``).
-        endpoint: API path relative to the base URL (leading slash optional).
-        json:     Request body dict.
-        params:   Query-string parameters.
-
-        Returns
-        -------
-        Parsed JSON response body.
-
-        Raises
-        ------
-        :class:`~palmpesa.exceptions.PalmPesaError` or one of its subclasses.
+        Returns the parsed JSON body; raises a
+        :class:`~palmpesa.exceptions.PalmPesaError` subclass otherwise.
         """
-        path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
-        auth_header = {"Authorization": f"Bearer {self.api_token}"}
-
-        last_exc: Exception | None = None
-        for attempt in range(1, self.max_retries + 1):
+        attempt = 0
+        while True:
+            response: httpx.Response | None = None
             try:
                 response = self._http.request(
-                    method=method,
-                    url=path,
-                    json=json,
-                    params=params,
-                    headers=auth_header,
+                    method, self._url(path), json=json, headers=self._headers
                 )
+            except httpx.TimeoutException as exc:
+                if attempt >= self.max_retries:
+                    raise RequestTimeoutError(f"PalmPesa request timed out: {exc}") from exc
+                reason = "timeout"
             except httpx.TransportError as exc:
-                last_exc = exc
-                if attempt < self.max_retries:
-                    _backoff(attempt)
-                    continue
-                raise PalmPesaError(f"Network error: {exc}") from exc
+                if attempt >= self.max_retries:
+                    raise NetworkError(f"PalmPesa network error: {exc}") from exc
+                reason = type(exc).__name__
+            else:
+                if response.status_code not in RETRY_STATUSES or attempt >= self.max_retries:
+                    return parse_response(response)
+                reason = f"HTTP {response.status_code}"
 
-            if response.status_code in _RETRY_STATUSES and attempt < self.max_retries:
-                logger.warning(
-                    "Received %d on attempt %d/%d — retrying …",
-                    response.status_code,
-                    attempt,
-                    self.max_retries,
-                )
-                _backoff(attempt)
-                continue
-
-            return _handle_response(response)
-
-        raise PalmPesaError(
-            f"Request failed after {self.max_retries} attempts"
-        ) from last_exc
+            delay = retry_delay(attempt, response)
+            log_retry(method, path, attempt, self.max_retries, reason, delay)
+            time.sleep(delay)
+            attempt += 1
 
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
 
-    def is_healthy(self) -> bool:
+    def verify_credentials(self) -> None:
         """
-        Check API reachability and token validity.
+        Confirm the API is reachable and the token is accepted.
 
-        Returns ``True`` if the API is reachable and the Bearer token is accepted.
+        Looks up a non-existent order (expects 404), so no payment is created.
+
+        Raises:
+            AuthenticationError / ForbiddenError / NetworkError / …
         """
         try:
-            self.request("GET", "/api/transactions", params={"page": 1, "per_page": 1})
-            return True
-        except Exception:
+            self.request("GET", self._payment_path(HEALTHCHECK_ORDER_ID))
+        except NotFoundError:
+            return
+
+    def is_healthy(self) -> bool:
+        """``True`` if the API is reachable and the token is accepted."""
+        try:
+            self.verify_credentials()
+        except PalmPesaError:
             return False
+        return True
 
     def close(self) -> None:
-        """Close the underlying HTTP connection pool."""
-        self._http.close()
+        """Close the HTTP connection pool (only if the SDK created it)."""
+        if self._owns_http:
+            self._http.close()
 
-    def __enter__(self) -> Self:
+    def __enter__(self: _T) -> _T:
         return self
 
-    def __exit__(self, *_: Any) -> None:
+    def __exit__(self, *_: object) -> None:
         self.close()
 
 
-# ------------------------------------------------------------------
-# Private helpers
-# ------------------------------------------------------------------
+# Backwards-compatible name from 0.1.x.
+PalmPesaClient = PalmPesa
 
-def _safe_json(response: httpx.Response) -> Any:
-    try:
-        return response.json()
-    except Exception:
-        return {"message": response.text}
-
-
-def _handle_response(response: httpx.Response) -> Any:
-    """Map HTTP status codes to structured PalmPesa exceptions."""
-    data = _safe_json(response)
-
-    if response.is_success:
-        return data
-
-    msg = data.get("message", "Unknown API error") if isinstance(data, dict) else str(data)
-    status = response.status_code
-
-    # PalmPesa gateway sometimes wraps a 429 inside a 502 — detect it via details.
-    if status >= 500 and isinstance(data, dict):
-        details = str(data.get("details", ""))
-        if "429" in details or "Too Many Requests" in details:
-            raise RateLimitError(msg, status_code=429, response=data)
-
-    if status == 400:
-        if any(p in msg.lower() for p in _INSUFFICIENT_FUNDS_PHRASES):
-            raise InsufficientFundsError(msg, status_code=status, response=data)
-        raise ValidationError(msg, status_code=status, response=data)
-    if status == 401:
-        raise AuthenticationError(msg, status_code=status, response=data)
-    if status == 403:
-        raise ForbiddenError(msg, status_code=status, response=data)
-    if status == 404:
-        raise NotFoundError(msg, status_code=status, response=data)
-    if status == 409:
-        raise ConflictError(msg, status_code=status, response=data)
-    if status == 429:
-        raise RateLimitError(msg, status_code=status, response=data)
-    if status >= 500:
-        raise ServerError(msg, status_code=status, response=data)
-
-    raise PalmPesaError(msg, status_code=status, response=data)
-
-
-def _backoff(attempt: int) -> None:
-    delay = 2 ** (attempt - 1)
-    logger.debug("Retrying in %d second(s) …", delay)
-    time.sleep(delay)
+__all__ = ["PalmPesa", "PalmPesaClient"]

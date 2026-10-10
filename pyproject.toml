@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "palmpesa-python-sdk"
-version = "0.1.0"
-description = "Production-grade Python SDK for the PalmPesa API — sync & async, USSD payments, webhooks, and transactions"
+version = "0.2.0"
+description = "Production-grade Python SDK for the PalmPesa Payments API v2 — sync & async, idempotent retries, typed models, signed callbacks"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -20,11 +20,18 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+    "Topic :: Office/Business :: Financial",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
     "httpx>=0.25.0",
 ]
+
+[project.urls]
+Documentation = "https://documentation.palmpesa.co.tz/"
+Source = "https://github.com/JAXPARROW/palmpesa-python-sdk"
 
 [project.optional-dependencies]
 dev = [
@@ -49,6 +56,9 @@ target-version = ["py310"]
 
 [tool.ruff]
 line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
 select = ["E", "F", "W", "I", "C", "B", "UP"]
 
 [tool.mypy]
@@ -56,6 +66,9 @@ python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+files = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--strict-markers"

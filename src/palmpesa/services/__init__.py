@@ -1,9 +1,6 @@
-from .payments import PaymentService, AsyncPaymentService
-from .transactions import TransactionService, AsyncTransactionService
+from .payments import AsyncPaymentService, PaymentService
 
 __all__ = [
     "PaymentService",
     "AsyncPaymentService",
-    "TransactionService",
-    "AsyncTransactionService",
 ]

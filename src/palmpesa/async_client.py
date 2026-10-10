@@ -1,233 +1,133 @@
 """
-Asynchronous PalmPesa HTTP client.
-
-Drop-in async counterpart to :class:`~palmpesa.client.PalmPesaClient`.
-Requires Python 3.10+ and ``httpx`` with async support (included by default).
+Asynchronous PalmPesa API v2 client — the asyncio counterpart of
+:class:`~palmpesa.client.PalmPesa`.
 
 Usage::
 
-    async with AsyncPalmPesaClient(api_token="…") as client:
-        result = await client.request("GET", "/api/transactions")
+    async with AsyncPalmPesa(api_token="…") as palmpesa:
+        payment = await palmpesa.payments.request_payment(...)
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
-import time
-from typing import Any
-try:
-    from typing import Self
-except ImportError:
-    from typing_extensions import Self
+from typing import Any, TypeVar
 
 import httpx
 
-from .exceptions import (
-    AuthenticationError,
-    ConflictError,
-    ForbiddenError,
-    InsufficientFundsError,
-    NotFoundError,
-    PalmPesaError,
-    RateLimitError,
-    ServerError,
-    ValidationError,
+from ._base import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
+    HEALTHCHECK_ORDER_ID,
+    RETRY_STATUSES,
+    BaseClient,
+    log_retry,
+    parse_response,
+    retry_delay,
 )
+from .exceptions import NetworkError, NotFoundError, PalmPesaError, RequestTimeoutError
+from .services.payments import AsyncPaymentService
 
-logger = logging.getLogger(__name__)
-
-_BASE_URL = "https://palmpesa.drmlelwa.co.tz"
-_DEFAULT_TIMEOUT = 30.0
-_MAX_RETRIES = 3
-_RETRY_STATUSES = {500, 502, 503, 504}
-_INSUFFICIENT_FUNDS_PHRASES = {"insufficient balance", "insufficient funds"}
+_T = TypeVar("_T", bound="AsyncPalmPesa")
 
 
-class AsyncPalmPesaClient:
+class AsyncPalmPesa(BaseClient):
     """
-    Production-grade asynchronous HTTP client for the PalmPesa API.
+    Asynchronous client for the PalmPesa Payments API v2.
 
-    Features
-    --------
-    - Bearer token authentication on every request.
-    - Exponential-backoff retries on transient 5xx errors.
-    - Structured exception hierarchy — never raises a bare ``Exception``.
-    - Async context-manager support (``async with`` statement).
-
-    Parameters
-    ----------
-    api_token:
-        Your PalmPesa Bearer API token.
-    base_url:
-        Override the base URL (e.g. for a staging environment).
-    timeout:
-        Request timeout in seconds (default: 30).
-    max_retries:
-        Maximum retry attempts on transient server errors (default: 3).
+    Takes the same parameters as :class:`~palmpesa.client.PalmPesa`, with
+    ``http_client`` being an :class:`httpx.AsyncClient`.
     """
+
+    payments: AsyncPaymentService
 
     def __init__(
         self,
         api_token: str,
-        base_url: str = _BASE_URL,
-        timeout: float = _DEFAULT_TIMEOUT,
-        max_retries: int = _MAX_RETRIES,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float | httpx.Timeout = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        user_agent: str | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.api_token = api_token
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self.max_retries = max_retries
-
-        self._http = httpx.AsyncClient(
-            base_url=self.base_url,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            timeout=self.timeout,
+        super().__init__(
+            api_token,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            user_agent=user_agent,
         )
+        self._owns_http = http_client is None
+        self._http = http_client or httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+        self.payments = AsyncPaymentService(self)
 
     # ------------------------------------------------------------------
     # Core request dispatcher
     # ------------------------------------------------------------------
 
     async def request(
-        self,
-        method: str,
-        endpoint: str,
-        json: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> Any:
-        """
-        Execute an authenticated API request with automatic retry on 5xx errors.
-
-        Parameters
-        ----------
-        method:   HTTP verb (``"GET"``, ``"POST"``).
-        endpoint: API path relative to the base URL (leading slash optional).
-        json:     Request body dict.
-        params:   Query-string parameters.
-
-        Returns
-        -------
-        Parsed JSON response body.
-
-        Raises
-        ------
-        :class:`~palmpesa.exceptions.PalmPesaError` or one of its subclasses.
-        """
-        path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
-        auth_header = {"Authorization": f"Bearer {self.api_token}"}
-
-        last_exc: Exception | None = None
-        for attempt in range(1, self.max_retries + 1):
+        self, method: str, path: str, *, json: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Async version of :meth:`palmpesa.client.PalmPesa.request`."""
+        attempt = 0
+        while True:
+            response: httpx.Response | None = None
             try:
                 response = await self._http.request(
-                    method=method,
-                    url=path,
-                    json=json,
-                    params=params,
-                    headers=auth_header,
+                    method, self._url(path), json=json, headers=self._headers
                 )
+            except httpx.TimeoutException as exc:
+                if attempt >= self.max_retries:
+                    raise RequestTimeoutError(f"PalmPesa request timed out: {exc}") from exc
+                reason = "timeout"
             except httpx.TransportError as exc:
-                last_exc = exc
-                if attempt < self.max_retries:
-                    await _async_backoff(attempt)
-                    continue
-                raise PalmPesaError(f"Network error: {exc}") from exc
+                if attempt >= self.max_retries:
+                    raise NetworkError(f"PalmPesa network error: {exc}") from exc
+                reason = type(exc).__name__
+            else:
+                if response.status_code not in RETRY_STATUSES or attempt >= self.max_retries:
+                    return parse_response(response)
+                reason = f"HTTP {response.status_code}"
 
-            if response.status_code in _RETRY_STATUSES and attempt < self.max_retries:
-                logger.warning(
-                    "Received %d on attempt %d/%d — retrying …",
-                    response.status_code,
-                    attempt,
-                    self.max_retries,
-                )
-                await _async_backoff(attempt)
-                continue
-
-            return _handle_response(response)
-
-        raise PalmPesaError(
-            f"Request failed after {self.max_retries} attempts"
-        ) from last_exc
+            delay = retry_delay(attempt, response)
+            log_retry(method, path, attempt, self.max_retries, reason, delay)
+            await asyncio.sleep(delay)
+            attempt += 1
 
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
 
-    async def is_healthy(self) -> bool:
-        """
-        Check API reachability and token validity.
-
-        Returns ``True`` if the API is reachable and the Bearer token is accepted.
-        """
+    async def verify_credentials(self) -> None:
+        """Async version of :meth:`palmpesa.client.PalmPesa.verify_credentials`."""
         try:
-            await self.request("GET", "/api/transactions", params={"page": 1, "per_page": 1})
-            return True
-        except Exception:
+            await self.request("GET", self._payment_path(HEALTHCHECK_ORDER_ID))
+        except NotFoundError:
+            return
+
+    async def is_healthy(self) -> bool:
+        """``True`` if the API is reachable and the token is accepted."""
+        try:
+            await self.verify_credentials()
+        except PalmPesaError:
             return False
+        return True
 
     async def close(self) -> None:
-        """Close the underlying async HTTP connection pool."""
-        await self._http.aclose()
+        """Close the HTTP connection pool (only if the SDK created it)."""
+        if self._owns_http:
+            await self._http.aclose()
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self: _T) -> _T:
         return self
 
-    async def __aexit__(self, *_: Any) -> None:
+    async def __aexit__(self, *_: object) -> None:
         await self.close()
 
 
-# ------------------------------------------------------------------
-# Private helpers
-# ------------------------------------------------------------------
+# Backwards-compatible name from 0.1.x.
+AsyncPalmPesaClient = AsyncPalmPesa
 
-def _safe_json(response: httpx.Response) -> Any:
-    try:
-        return response.json()
-    except Exception:
-        return {"message": response.text}
-
-
-def _handle_response(response: httpx.Response) -> Any:
-    """Map HTTP status codes to structured PalmPesa exceptions."""
-    data = _safe_json(response)
-
-    if response.is_success:
-        return data
-
-    msg = data.get("message", "Unknown API error") if isinstance(data, dict) else str(data)
-    status = response.status_code
-
-    # PalmPesa gateway sometimes wraps a 429 inside a 502 — detect it via details.
-    if status >= 500 and isinstance(data, dict):
-        details = str(data.get("details", ""))
-        if "429" in details or "Too Many Requests" in details:
-            raise RateLimitError(msg, status_code=429, response=data)
-
-    if status == 400:
-        if any(p in msg.lower() for p in _INSUFFICIENT_FUNDS_PHRASES):
-            raise InsufficientFundsError(msg, status_code=status, response=data)
-        raise ValidationError(msg, status_code=status, response=data)
-    if status == 401:
-        raise AuthenticationError(msg, status_code=status, response=data)
-    if status == 403:
-        raise ForbiddenError(msg, status_code=status, response=data)
-    if status == 404:
-        raise NotFoundError(msg, status_code=status, response=data)
-    if status == 409:
-        raise ConflictError(msg, status_code=status, response=data)
-    if status == 429:
-        raise RateLimitError(msg, status_code=status, response=data)
-    if status >= 500:
-        raise ServerError(msg, status_code=status, response=data)
-
-    raise PalmPesaError(msg, status_code=status, response=data)
-
-
-async def _async_backoff(attempt: int) -> None:
-    delay = 2 ** (attempt - 1)
-    logger.debug("Retrying in %d second(s) …", delay)
-    await asyncio.sleep(delay)
+__all__ = ["AsyncPalmPesa", "AsyncPalmPesaClient"]

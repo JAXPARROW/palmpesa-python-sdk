@@ -1,141 +1,102 @@
 """
-PalmPesa Python SDK
-===================
+PalmPesa Python SDK — Payments API v2
+=====================================
 
 Sync usage::
 
-    from palmpesa import PalmPesa
+    from palmpesa import PalmPesa, generate_transaction_id
 
     with PalmPesa(api_token="…") as palmpesa:
-        result = palmpesa.payments.initiate_mobile_payment(
-            amount=5000,
-            phone="0693662424",
-            transaction_id="TXN001",
-            name="John Doe",
-            email="john@example.com",
-            callback_url="https://yourapp.com/webhook",
+        payment = palmpesa.payments.request_payment(
+            transaction_id=generate_transaction_id("ORDER"),
+            amount=10_000,
+            phone="0712345678",
+            name="Juma Hassan",
+            email="juma@example.com",
+            callback_url="https://shop.example.com/palmpesa/callback",
         )
-        status = palmpesa.payments.get_order_status(result["order_id"])
-        transactions = palmpesa.transactions.list_all(page=1, per_page=20)
+        payment = palmpesa.payments.get_payment(payment.order_id)
+        if payment.is_paid:
+            ...
 
 Async usage::
 
     from palmpesa import AsyncPalmPesa
 
     async with AsyncPalmPesa(api_token="…") as palmpesa:
-        result = await palmpesa.payments.initiate_mobile_payment(
-            amount=5000,
-            phone="0693662424",
-            transaction_id="TXN001",
-            name="John Doe",
-            email="john@example.com",
-            callback_url="https://yourapp.com/webhook",
-        )
+        payment = await palmpesa.payments.request_payment(...)
 """
 
 from __future__ import annotations
 
 from ._version import __version__
-from .client import PalmPesaClient
-from .async_client import AsyncPalmPesaClient
-from .webhook import (
-    WebhookValidator,
-    WebhookEvent,
-    PAYMENT_STATUS_COMPLETED,
-    PAYMENT_STATUS_PENDING,
-    PAYMENT_STATUS_FAILED,
-)
+from .async_client import AsyncPalmPesa, AsyncPalmPesaClient
+from .client import PalmPesa, PalmPesaClient
 from .exceptions import (
-    PalmPesaError,
+    AccountFrozenError,
     AuthenticationError,
-    ForbiddenError,
-    ValidationError,
-    InsufficientFundsError,
-    NotFoundError,
     ConflictError,
+    ForbiddenError,
+    NetworkError,
+    NotFoundError,
+    PalmPesaError,
     RateLimitError,
+    RequestTimeoutError,
     ServerError,
+    ValidationError,
+    WebhookVerificationError,
 )
-from .services.payments import PaymentService, AsyncPaymentService
-from .services.transactions import TransactionService, AsyncTransactionService
-from .utils import normalize_phone, generate_transaction_id
-
-
-class PalmPesa(PalmPesaClient):
-    """
-    Synchronous PalmPesa client with all service namespaces attached.
-
-    Attributes:
-        payments:     :class:`~palmpesa.services.payments.PaymentService`
-        transactions: :class:`~palmpesa.services.transactions.TransactionService`
-    """
-
-    def __init__(
-        self,
-        api_token: str,
-        base_url: str = "https://palmpesa.drmlelwa.co.tz",
-        timeout: float = 30.0,
-        max_retries: int = 3,
-    ) -> None:
-        super().__init__(api_token, base_url, timeout, max_retries)
-        self.payments = PaymentService(self)
-        self.transactions = TransactionService(self)
-
-
-class AsyncPalmPesa(AsyncPalmPesaClient):
-    """
-    Asynchronous PalmPesa client with all service namespaces attached.
-
-    Attributes:
-        payments:     :class:`~palmpesa.services.payments.AsyncPaymentService`
-        transactions: :class:`~palmpesa.services.transactions.AsyncTransactionService`
-    """
-
-    def __init__(
-        self,
-        api_token: str,
-        base_url: str = "https://palmpesa.drmlelwa.co.tz",
-        timeout: float = 30.0,
-        max_retries: int = 3,
-    ) -> None:
-        super().__init__(api_token, base_url, timeout, max_retries)
-        self.payments = AsyncPaymentService(self)
-        self.transactions = AsyncTransactionService(self)
-
-
-__version__ = __version__
+from .models import CallbackEvent, CallbackEventType, FailureReason, Payment, PaymentStatus
+from .services.payments import AsyncPaymentService, PaymentService
+from .utils import MAX_AMOUNT, MIN_AMOUNT, generate_transaction_id, normalize_phone
+from .webhook import (
+    EVENT_ID_HEADER,
+    SIGNATURE_HEADER,
+    TIMESTAMP_HEADER,
+    WebhookVerifier,
+    compute_signature,
+    parse_callback,
+)
 
 __all__ = [
-    # Main clients
+    "__version__",
+    # Clients
     "PalmPesa",
     "AsyncPalmPesa",
-    # Base clients (for subclassing)
     "PalmPesaClient",
     "AsyncPalmPesaClient",
-    # Webhook
-    "WebhookValidator",
-    "WebhookEvent",
-    "PAYMENT_STATUS_COMPLETED",
-    "PAYMENT_STATUS_PENDING",
-    "PAYMENT_STATUS_FAILED",
+    # Services (for type hints)
+    "PaymentService",
+    "AsyncPaymentService",
+    # Models
+    "Payment",
+    "PaymentStatus",
+    "FailureReason",
+    "CallbackEvent",
+    "CallbackEventType",
+    # Callbacks
+    "WebhookVerifier",
+    "parse_callback",
+    "compute_signature",
+    "EVENT_ID_HEADER",
+    "TIMESTAMP_HEADER",
+    "SIGNATURE_HEADER",
     # Utilities
     "normalize_phone",
     "generate_transaction_id",
+    "MIN_AMOUNT",
+    "MAX_AMOUNT",
     # Exceptions
     "PalmPesaError",
+    "NetworkError",
+    "RequestTimeoutError",
     "AuthenticationError",
     "ForbiddenError",
+    "AccountFrozenError",
     "ValidationError",
-    "InsufficientFundsError",
     "NotFoundError",
     "ConflictError",
     "RateLimitError",
     "ServerError",
-    # Services (for type hints)
-    "PaymentService",
-    "AsyncPaymentService",
-    "TransactionService",
-    "AsyncTransactionService",
-    # Version
-    "__version__",
+    "WebhookVerificationError",
 ]
